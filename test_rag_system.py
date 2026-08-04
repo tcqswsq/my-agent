@@ -6,7 +6,7 @@ RAG 系统工具集成测试
   2. 文档处理 — enterprise / merge / fenkuai
   3. 入库管道 — RAGPipelineOffline.ingest_file / update_file
   4. 混合检索 — HybridRetriever.retrieve
-  5. 6 个 LangChain 工具 — ingest / ingest_folder / retrieve / update / list_archive / list_active
+  5. 7 个 LangChain 工具 — ingest / ingest_folder / retrieve / update / list_archive / list_active / delete_file
 
 运行方式：
   cd E:/ana/python/rag_system
@@ -634,26 +634,29 @@ class TestLangChainTools(unittest.TestCase):
 class TestBuild(unittest.TestCase):
     """测试 build.py 一键装配"""
 
-    def test_build_returns_retriever_and_6_tools(self):
-        """用 mock 替换 SentenceTransformer 避免加载真实模型"""
-        with patch('build.SentenceTransformer', return_value=_make_fake_embed_model()):
-            from .build import build
-            retriever, tools = build()
+    def test_build_returns_retriever_and_7_tools(self):
+        """验证 build() 返回 7 个工具（API 模式，无需 mock）"""
+        # API 模式下不会加载本地模型，直接测试即可
+        import os
+        os.environ.setdefault("EMBED_MODE", "api")
+        from build import build
+        retriever, tools = build()
 
-            self.assertIsNotNone(retriever)
-            self.assertEqual(len(tools), 6)
+        self.assertIsNotNone(retriever)
+        self.assertEqual(len(tools), 7)
 
-            tool_names = [t.name for t in tools]
-            expected = [
-                "rag_ingest_file",
-                "rag_ingest_folder",
-                "rag_retrieve",
-                "rag_update_file",
-                "rag_list_archive",
-                "rag_list_active_files",
-            ]
-            for name in expected:
-                self.assertIn(name, tool_names, f"缺少工具: {name}")
+        tool_names = [t.name for t in tools]
+        expected = [
+            "rag_ingest_file",
+            "rag_ingest_folder",
+            "rag_retrieve",
+            "rag_update_file",
+            "rag_list_archive",
+            "rag_list_active_files",
+            "rag_delete_file",
+        ]
+        for name in expected:
+            self.assertIn(name, tool_names, f"缺少工具: {name}")
 
 
 # ======================================================================

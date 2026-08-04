@@ -10,7 +10,7 @@ from core.pipeline import RAGPipelineOffline
 from core.retriever import HybridRetriever, RAGHybridRetrieverLC
 from tools.ingest import RAGIngestTool, RAGIngestFolderTool
 from tools.retrieve import RAGRetrieveTool
-from tools.manage import RAGUpdateTool, RAGListArchiveTool, RAGListActiveTool
+from tools.manage import RAGUpdateTool, RAGListArchiveTool, RAGListActiveTool, RAGDeleteTool
 from config import *
 
 
@@ -54,5 +54,6 @@ def build():
         RAGUpdateTool(pipeline=pipeline),
         RAGListArchiveTool(archive_store=archive),
         RAGListActiveTool(metadata_store=ms),
+        RAGDeleteTool(metadata_store=ms, vector_store=vs),
     ]
     return retriever_lc, tools

@@ -162,6 +162,16 @@ body {
     margin-bottom: 8px; padding-bottom: 8px;
     border-bottom: 1px solid var(--border);
 }
+.msg.ai .bubble .tool-call {
+    font-size: 12px; color: #6366f1; background: #eef2ff;
+    padding: 4px 8px; margin-bottom: 4px; border-radius: 6px;
+    border-left: 3px solid #6366f1;
+}
+.msg.ai .bubble .tool-result {
+    font-size: 11px; padding: 3px 8px; margin-bottom: 4px; border-radius: 4px;
+}
+.msg.ai .bubble .tool-result.ok { color: #16a34a; background: #f0fdf4; }
+.msg.ai .bubble .tool-result.fail { color: #dc2626; background: #fef2f2; }
 
 .chat-input-area {
     display: flex;
@@ -613,6 +623,7 @@ async function sendMessage() {
         const decoder = new TextDecoder();
         let buffer = '';
         let fullText = '';
+        let toolCallsHtml = '';
 
         while (true) {
             const {done, value} = await reader.read();
@@ -628,13 +639,21 @@ async function sendMessage() {
                     const data = JSON.parse(line.slice(6));
                     if (data.type === 'token') {
                         fullText += data.text;
-                        aiText.textContent = fullText;
+                        aiText.innerHTML = toolCallsHtml + fullText;
                         msgs.scrollTop = msgs.scrollHeight;
-                    } else if (data.type === 'context' && data.text && !data.text.includes('未找到')) {
-                        // 在气泡顶部显示来源提示
-                        aiText.innerHTML = '<div class="context-label">📖 已从知识库检索到相关资料</div>' + (fullText || '思考中...');
+                    } else if (data.type === 'tool_call') {
+                        toolCallsHtml += `<div class="tool-call">🔧 调用: <b>${escapeHtml(data.name)}</b></div>`;
+                        aiText.innerHTML = toolCallsHtml + (fullText || '思考中...');
+                        msgs.scrollTop = msgs.scrollHeight;
+                    } else if (data.type === 'tool_result') {
+                        const ok = data.output && !data.output.startsWith('Error') && !data.output.startsWith('❌');
+                        const icon = ok ? '✅' : '⚠️';
+                        const summary = (data.output || '').slice(0, 100);
+                        toolCallsHtml += `<div class="tool-result ${ok ? 'ok' : 'fail'}">${icon} ${escapeHtml(data.name)}: ${escapeHtml(summary)}</div>`;
+                        aiText.innerHTML = toolCallsHtml + (fullText || '处理中...');
+                        msgs.scrollTop = msgs.scrollHeight;
                     } else if (data.type === 'error') {
-                        aiText.textContent = '错误: ' + data.text;
+                        aiText.innerHTML = toolCallsHtml + '<span style="color:#e74c3c">错误: ' + escapeHtml(data.text) + '</span>';
                     }
                 } catch(e) {}
             }

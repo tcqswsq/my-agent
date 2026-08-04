@@ -1,6 +1,9 @@
+import os
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 from pathlib import Path
+
+
 class UpdateFileInput(BaseModel):
     doc_code: str = Field(description="要更新的文件业务编码（如 EMP-HB-001）")
     new_file_path: str = Field(description="新文件的本地路径")
@@ -51,3 +54,46 @@ class RAGListActiveTool(BaseTool):
                 continue
             lines.append(f"📄 {f['original_filename']} | doc_code={f['doc_code']} | id={f['file_id']}")
         return "\n".join(lines) if lines else f"未找到含 '{keyword}' 的文件。"
+
+
+class DeleteFileInput(BaseModel):
+    doc_code: str = Field(default="", description="要删除文件的业务编码（与 file_id 二选一）")
+    file_id: str = Field(default="", description="要删除文件的 file_id（与 doc_code 二选一）")
+
+
+class RAGDeleteTool(BaseTool):
+    name: str = "rag_delete_file"
+    description: str = "🗑️ 永久删除知识库文件。通过 doc_code 或 file_id 定位，停用元数据、删除向量索引、从磁盘移除原始文件。⚠️ 此操作不可逆！"
+    args_schema: type = DeleteFileInput
+    metadata_store: object = None
+    vector_store: object = None
+
+    def _run(self, doc_code: str = "", file_id: str = "") -> str:
+        # 通过 doc_code 或 file_id 定位文件
+        if doc_code and not file_id:
+            meta = self.metadata_store.find_by_doc_code(doc_code)
+            if not meta:
+                return f"❌ 未找到 doc_code={doc_code} 的活跃文件，可能已被删除或不存在。"
+            file_id = meta["file_id"]
+            storage_path = meta.get("storage_path", "")
+            original_name = meta.get("original_filename", "")
+        elif file_id:
+            meta = self.metadata_store.get_file(file_id)
+            if not meta:
+                return f"❌ 未找到 file_id={file_id} 的文件。"
+            storage_path = meta.get("storage_path", "")
+            original_name = meta.get("original_filename", "")
+        else:
+            return "❌ 请提供 doc_code 或 file_id 来定位要删除的文件。"
+
+        # 1. 停用元数据
+        self.metadata_store.deactivate_file(file_id)
+        # 2. 删除向量索引
+        self.vector_store.delete_by_file_id(file_id)
+        # 3. 从磁盘删除原始文件
+        if storage_path:
+            sp = Path(storage_path)
+            if sp.exists():
+                sp.unlink()
+
+        return f"✅ 已永久删除文件「{original_name}」：file_id={file_id}"

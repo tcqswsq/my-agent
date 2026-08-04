@@ -34,6 +34,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 app_state = {
     "retriever": None,
     "tools": None,
+    "mcp_tools": [],
     "pipeline": None,
     "archive_store": None,
     "metadata_store": None,
@@ -69,8 +70,17 @@ async def lifespan(app: FastAPI):
             elif name == "rag_list_active_files" and hasattr(tool, 'metadata_store'):
                 app_state["metadata_store"] = tool.metadata_store
 
-        print(f"[启动] 系统就绪，加载了 {len(tools)} 个工具")
-        print(f"[启动] 工具列表: {[t.name for t in tools]}")
+        # 异步加载 MCP 远程工具（lifespan 本身是 async，直接 await）
+        try:
+            from mcp_client import load_remote_tools
+            app_state["mcp_tools"] = await load_remote_tools()
+            if app_state["mcp_tools"]:
+                print(f"[启动] MCP 远程工具: {[t.name for t in app_state['mcp_tools']]}")
+        except Exception as e:
+            print(f"[启动] MCP 加载失败（不影响本地功能）: {e}")
+            app_state["mcp_tools"] = []
+
+        print(f"[启动] 系统就绪，加载了 {len(tools)} 个本地工具 + {len(app_state['mcp_tools'])} 个远程工具")
 
     except Exception as e:
         app_state["status_msg"] = f"启动失败: {str(e)}"
@@ -172,11 +182,11 @@ async def status():
 
 
 # ======================================================================
-# 智能问答 (SSE 流式)
+# 智能问答 (Agent 模式 — SSE 流式)
 # ======================================================================
 @app.post("/api/chat")
 async def chat(request: Request):
-    """AI 问答 — SSE 流式返回"""
+    """AI 问答 — Agent 自主调用工具，SSE 流式返回"""
     if not app_state["ready"]:
         return JSONResponse({"error": "系统尚未就绪"}, status_code=503)
 
@@ -186,64 +196,59 @@ async def chat(request: Request):
         return JSONResponse({"error": "消息不能为空"}, status_code=400)
 
     async def generate():
-        # 1) 检索相关文档
-        try:
-            retriever = app_state["retriever"]
-            docs = retriever.invoke(user_message)
-            if docs:
-                context = "\n\n---\n\n".join([
-                    f"[来源: {d.metadata.get('source', '未知')}] {d.page_content[:500]}"
-                    for d in docs[:5]
-                ])
-            else:
-                context = "知识库中未找到相关内容。"
-        except Exception as e:
-            context = f"检索失败: {str(e)}"
+        from langchain.agents import create_agent
 
-        yield f"data: {json.dumps({'type': 'context', 'text': context})}\n\n"
-
-        # 2) 如果知识库无结果，直接返回
-        if "未找到" in context or "检索失败" in context:
-            yield f"data: {json.dumps({'type': 'token', 'text': '知识库中未找到相关内容，请尝试上传相关文档。'})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'full': ''})}\n\n"
+        # 合并本地工具 + MCP 远程工具
+        all_tools = list(app_state["tools"] or []) + list(app_state["mcp_tools"] or [])
+        if not all_tools:
+            yield f"data: {json.dumps({'type': 'error', 'text': '没有可用工具'})}\n\n"
             return
 
-        # 3) 调用 LLM 流式输出
+        llm = ChatOpenAI(
+            model=os.getenv("MODEL", "deepseek-v4-flash"),
+            openai_api_key=os.getenv("API"),
+            openai_api_base=os.getenv("URL", "https://api.deepseek.com"),
+            temperature=0.3,
+            streaming=True,
+        )
+
+        system_prompt = """你是企业内部智能助手，可以自主调用工具来完成任务。
+- 查内部文档/制度 -> 知识库检索工具
+- 上传/更新/删除文件 -> 知识库管理工具
+- GitHub 操作 -> GitHub 工具
+- 通用知识 -> 直接回答"""
+
+        agent = create_agent(model=llm, tools=all_tools, system_prompt=system_prompt)
+
         try:
-            system_prompt = (
-                "你是企业内部智能助手。请严格基于以下参考资料回答用户问题。\n"
-                "如果参考资料不足以回答，请明确告知用户。禁止编造信息。\n\n"
-                f"### 参考资料\n{context}"
+            # 先获取 Agent 执行过程的中间步骤
+            result = await agent.ainvoke(
+                {"messages": [HumanMessage(content=user_message)]}
             )
+            # 提取最终回答
+            messages = result.get("messages", [])
+            for msg in messages:
+                # 显示工具调用
+                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        name = tc.get('name', 'unknown')
+                        args = str(tc.get('args', {}))[:300]
+                        yield f"data: {json.dumps({'type': 'tool_call', 'name': name, 'input': args})}\n\n"
+                # 显示工具结果
+                if hasattr(msg, 'name') and hasattr(msg, 'content') and not hasattr(msg, 'tool_calls'):
+                    summary = str(msg.content)[:300]
+                    yield f"data: {json.dumps({'type': 'tool_result', 'name': msg.name, 'output': summary})}\n\n"
 
-            llm = ChatOpenAI(
-                model=os.getenv("MODEL", "deepseek-v4-flash"),
-                openai_api_key=os.getenv("API"),
-                openai_api_base=os.getenv("URL", "https://api.deepseek.com"),
-                temperature=0.3,
-                streaming=True,
-            )
-
-            full = ""
-            async for chunk in llm.astream([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_message),
-            ]):
-                if chunk.content:
-                    full += chunk.content
-                    yield f"data: {json.dumps({'type': 'token', 'text': chunk.content})}\n\n"
-
-            yield f"data: {json.dumps({'type': 'done', 'full': full})}\n\n"
+            # 最终回答（最后一条 AIMessage）
+            final_msg = messages[-1]
+            answer = final_msg.content if hasattr(final_msg, 'content') else str(final_msg)
+            yield f"data: {json.dumps({'type': 'token', 'text': answer})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'full': answer})}\n\n"
 
         except Exception as e:
-            # LLM 调用失败时，降级返回检索结果
-            err_msg = str(e)
-            fallback = (
-                f"⚠️ AI 模型暂时不可用（{err_msg[:100]}）。\n\n"
-                f"以下是从知识库直接检索到的相关内容：\n\n{context[:800]}"
-            )
-            yield f"data: {json.dumps({'type': 'token', 'text': fallback})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'full': fallback, 'fallback': True})}\n\n"
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'error', 'text': f'执行出错: {str(e)[:300]}'})}\n\n"
 
     return StreamingResponse(
         generate(),
