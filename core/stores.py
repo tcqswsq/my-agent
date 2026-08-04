@@ -20,7 +20,7 @@ class OriginalFileStore:
 
     def ingest(self, file_stream: bytes, original_filename: str,
                uploader_id: str = "system", source_tag: str = "upload",
-               doc_code: str = "") -> dict:  # ← 加参数
+               doc_code: str = "", category: str = "其他", tags: str = "") -> dict:
         file_id = f"f_{uuid.uuid4().hex[:12]}"
         content_hash = hashlib.sha256(file_stream).hexdigest()
         try:
@@ -34,7 +34,7 @@ class OriginalFileStore:
             f.write(file_stream)
         return {
             "file_id": file_id,
-            "doc_code": doc_code,  # ← 新增
+            "doc_code": doc_code,
             "content_hash": f"sha256:{content_hash}",
             "storage_path": str(storage_path),
             "original_filename": original_filename,
@@ -43,7 +43,9 @@ class OriginalFileStore:
             "upload_time": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
             "status": "uploaded",
             "uploader_id": uploader_id,
-            "source_tag": source_tag
+            "source_tag": source_tag,
+            "category": category,
+            "tags": tags,
         }
 
 
@@ -70,6 +72,9 @@ class MetadataStore:
         finally:
             conn.close()
 
+    # 预定义分类
+    BUILTIN_CATEGORIES = ["制度规章", "技术文档", "财务资料", "人力资源", "项目管理", "产品文档", "培训材料", "其他"]
+
     def _init_schema(self):
         with self._connect() as conn:
             conn.executescript("""
@@ -86,10 +91,10 @@ class MetadataStore:
                     source_tag TEXT,
                     status TEXT DEFAULT 'uploaded',
                     is_active INTEGER DEFAULT 1,
-                    version_tag TEXT DEFAULT 'v1.0'
+                    version_tag TEXT DEFAULT 'v1.0',
+                    category TEXT DEFAULT '其他',
+                    tags TEXT DEFAULT ''
                 );
-                CREATE INDEX IF NOT EXISTS idx_files_active ON files(is_active);
-                CREATE INDEX IF NOT EXISTS idx_files_doc_code ON files(doc_code);
 
                 CREATE TABLE IF NOT EXISTS chunks (
                     chunk_id TEXT PRIMARY KEY,
@@ -102,6 +107,17 @@ class MetadataStore:
                     created_at TEXT DEFAULT (datetime('now')),
                     FOREIGN KEY(file_id) REFERENCES files(file_id)
                 );
+            """)
+            # 兼容旧库迁移：在创建索引之前先补列
+            for col, default in [("category", "其他"), ("tags", "")]:
+                try:
+                    conn.execute(f"ALTER TABLE files ADD COLUMN {col} TEXT DEFAULT '{default}'")
+                except sqlite3.OperationalError:
+                    pass
+            conn.executescript("""
+                CREATE INDEX IF NOT EXISTS idx_files_active ON files(is_active);
+                CREATE INDEX IF NOT EXISTS idx_files_doc_code ON files(doc_code);
+                CREATE INDEX IF NOT EXISTS idx_files_category ON files(category);
                 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
             """)
             conn.commit()
@@ -111,13 +127,17 @@ class MetadataStore:
             conn.execute("""
                 INSERT OR REPLACE INTO files
                 (file_id, doc_code, original_filename, storage_path, content_hash,
-                 mime_type, file_size, upload_time, uploader_id, source_tag, status, version_tag)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                 mime_type, file_size, upload_time, uploader_id, source_tag, status,
+                 version_tag, category, tags)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 meta["file_id"], meta.get("doc_code", ""),
                 meta["original_filename"], meta["storage_path"], meta["content_hash"],
                 meta["mime_type"], meta["file_size"], meta["upload_time"],
-                meta["uploader_id"], meta["source_tag"], meta["status"], meta.get("version_tag", "v1.0")
+                meta["uploader_id"], meta["source_tag"], meta["status"],
+                meta.get("version_tag", "v1.0"),
+                meta.get("category", "其他"),
+                meta.get("tags", ""),
             ))
             conn.commit()
 
@@ -165,10 +185,42 @@ class MetadataStore:
             ).fetchone()
             return dict(row) if row else None
 
-    def get_active_files(self) -> List[dict]:
+    def get_active_files(self, category: str = "", tag: str = "") -> List[dict]:
+        with self._connect() as conn:
+            query = "SELECT file_id, doc_code, original_filename, upload_time, category, tags FROM files WHERE is_active=1"
+            params = []
+            if category:
+                query += " AND category=?"
+                params.append(category)
+            if tag:
+                query += " AND tags LIKE ?"
+                params.append(f"%{tag}%")
+            query += " ORDER BY upload_time DESC"
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+
+    def update_file_metadata(self, file_id: str, category: str = "", tags: str = "") -> bool:
+        """更新文件的分类和标签"""
+        updates, params = [], []
+        if category:
+            updates.append("category=?")
+            params.append(category)
+        if tags:
+            updates.append("tags=?")
+            params.append(tags)
+        if not updates:
+            return False
+        params.append(file_id)
+        with self._connect() as conn:
+            conn.execute(f"UPDATE files SET {', '.join(updates)} WHERE file_id=?", params)
+            conn.commit()
+        return True
+
+    def get_category_stats(self) -> List[dict]:
+        """各分类文件数统计"""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT file_id, doc_code, original_filename, upload_time FROM files WHERE is_active=1"
+                "SELECT category, COUNT(*) as cnt FROM files WHERE is_active=1 GROUP BY category ORDER BY cnt DESC"
             ).fetchall()
             return [dict(r) for r in rows]
 

@@ -29,6 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT.parent))
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
+from core.async_ingest import get_task_manager
 
 # ── 全局状态 ──
 app_state = {
@@ -38,6 +39,7 @@ app_state = {
     "pipeline": None,
     "archive_store": None,
     "metadata_store": None,
+    "task_manager": None,
     "ready": False,
     "status_msg": "正在初始化...",
 }
@@ -79,6 +81,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"[启动] MCP 加载失败（不影响本地功能）: {e}")
             app_state["mcp_tools"] = []
+
+        # 初始化异步入库管理器
+        app_state["task_manager"] = get_task_manager()
 
         print(f"[启动] 系统就绪，加载了 {len(tools)} 个本地工具 + {len(app_state['mcp_tools'])} 个远程工具")
 
@@ -269,6 +274,8 @@ async def ingest(
     file: UploadFile = File(...),
     doc_code: str = Form(...),
     uploader_id: str = Form("system"),
+    category: str = Form("其他"),
+    tags: str = Form(""),
 ):
     """单文件入库"""
     if not app_state["ready"]:
@@ -293,6 +300,8 @@ async def ingest(
             filename=str(tmp_file),
             doc_code=doc_code,
             uploader_id=uploader_id,
+            category=category,
+            tags=tags,
         )
 
         # 清理临时文件
@@ -340,6 +349,101 @@ async def ingest_folder(request: Request):
 
 
 # ======================================================================
+# 异步入库（不阻塞请求）
+# ======================================================================
+@app.post("/api/ingest-async")
+async def ingest_async(
+    file: UploadFile = File(...),
+    doc_code: str = Form(...),
+    uploader_id: str = Form("system"),
+    category: str = Form("其他"),
+    tags: str = Form(""),
+):
+    """异步单文件入库 — 立即返回 task_id，通过 /api/ingest/{task_id}/status 轮询进度"""
+    if not app_state["ready"]:
+        return JSONResponse({"error": "系统尚未就绪"}, status_code=503)
+
+    try:
+        content = await file.read()
+        pipeline = app_state["pipeline"]
+        tm = app_state["task_manager"]
+
+        task_id = tm.submit(
+            pipeline, content, file.filename,
+            doc_code=doc_code, uploader_id=uploader_id,
+            category=category, tags=tags,
+        )
+        return {
+            "success": True,
+            "task_id": task_id,
+            "status_url": f"/api/ingest/{task_id}/status",
+        }
+    except Exception as e:
+        return JSONResponse({"success": False, "message": f"提交失败: {str(e)}"}, status_code=500)
+
+
+@app.get("/api/ingest/{task_id}/status")
+async def ingest_status(task_id: str):
+    """查询异步入库任务状态"""
+    tm = app_state.get("task_manager")
+    if not tm:
+        return JSONResponse({"error": "任务管理器未初始化"}, status_code=503)
+
+    status = tm.get_status(task_id)
+    if status is None:
+        return JSONResponse({"error": f"任务不存在: {task_id}"}, status_code=404)
+    return {"success": True, "task": status}
+
+
+# ======================================================================
+# 文件元数据管理
+# ======================================================================
+@app.put("/api/files/{file_id}/metadata")
+async def update_file_metadata(file_id: str, request: Request):
+    """更新文件分类和标签"""
+    if not app_state["ready"]:
+        return JSONResponse({"error": "系统尚未就绪"}, status_code=503)
+
+    body = await request.json()
+    category = body.get("category", "")
+    tags = body.get("tags", "")
+
+    ms = app_state["metadata_store"]
+    ok = ms.update_file_metadata(file_id, category=category, tags=tags)
+    if ok:
+        return {"success": True, "message": f"已更新 {file_id} 的元数据"}
+    return JSONResponse({"success": False, "message": "请至少指定 category 或 tags"}, status_code=400)
+
+
+# ======================================================================
+# 分类统计
+# ======================================================================
+@app.get("/api/categories")
+async def category_stats():
+    """各分类的文件数统计"""
+    if not app_state["ready"]:
+        return JSONResponse({"error": "系统尚未就绪"}, status_code=503)
+
+    ms = app_state["metadata_store"]
+    stats = ms.get_category_stats()
+    return {"success": True, "categories": stats, "builtin": ms.BUILTIN_CATEGORIES}
+
+
+# ======================================================================
+# OCR 状态
+# ======================================================================
+@app.get("/api/ocr-status")
+async def ocr_status():
+    """检查 OCR 是否可用"""
+    from core.pipeline import RAGPipelineOffline
+    available = RAGPipelineOffline._check_ocr()
+    return {
+        "available": available,
+        "message": "OCR 就绪，支持扫描件 PDF 和图片" if available else "OCR 不可用，请安装: pip install pytesseract pymupdf Pillow"
+    }
+
+
+# ======================================================================
 # 知识检索
 # ======================================================================
 @app.post("/api/retrieve")
@@ -383,8 +487,8 @@ async def retrieve(request: Request):
 # 文件管理
 # ======================================================================
 @app.get("/api/files")
-async def list_files(keyword: str = Query("")):
-    """活跃文件列表"""
+async def list_files(keyword: str = Query(""), category: str = Query(""), tag: str = Query("")):
+    """活跃文件列表，可选按 keyword / category / tag 筛选"""
     if not app_state["ready"]:
         return JSONResponse({"error": "系统尚未就绪"}, status_code=503)
 
@@ -393,19 +497,22 @@ async def list_files(keyword: str = Query("")):
         if list_tool is None:
             return JSONResponse({"error": "找不到文件列表工具"}, status_code=500)
 
-        result = list_tool._run(keyword=keyword)
+        result = list_tool._run(keyword=keyword, category=category, tag=tag)
 
         # 解析工具返回的文本为结构化数据
         files = []
         for line in result.split("\n"):
             line = line.strip()
             if line.startswith("📄"):
-                # 格式: 📄 filename | doc_code=CODE | id=FILE_ID
+                # 格式: 📄 filename | doc_code=CODE | id=FILE_ID | 分类=CAT | 标签=TAGS
                 parts = line.replace("📄 ", "").split(" | ")
                 entry = {}
                 for p in parts:
                     if "=" in p:
                         k, v = p.split("=", 1)
+                        entry[k.strip()] = v.strip()
+                    elif "：" in p:
+                        k, v = p.split("：", 1)
                         entry[k.strip()] = v.strip()
                     else:
                         entry["original_filename"] = p.strip()

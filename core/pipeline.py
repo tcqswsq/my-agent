@@ -4,16 +4,11 @@ from pathlib import Path
 from typing import List, Dict
 from langchain_core.documents import Document
 
-# 延迟导入，防止循环依赖
-def _get_loaders():
-    from langchain_community.document_loaders import (
-        UnstructuredPDFLoader, Docx2txtLoader, TextLoader,
-        UnstructuredExcelLoader, UnstructuredPowerPointLoader,
-        UnstructuredHTMLLoader, JSONLoader
-    )
-    return locals()
 
 class RAGPipelineOffline:
+    # 图片格式（走 OCR）
+    IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp'}
+
     def __init__(self, original_store, metadata_store, vector_store, clean_text_store, embed_model, archive_store=None):
         self.fs = original_store
         self.ms = metadata_store
@@ -22,27 +17,88 @@ class RAGPipelineOffline:
         self.model = embed_model
         self.archive = archive_store
 
+    # ========== OCR 引擎（延迟初始化） ==========
+    _ocr_checked = False
+    _ocr_available = False
+
+    @classmethod
+    def _check_ocr(cls) -> bool:
+        """检测 OCR 依赖是否可用"""
+        if cls._ocr_checked:
+            return cls._ocr_available
+        cls._ocr_checked = True
+        try:
+            import fitz  # pymupdf
+            import pytesseract
+            from PIL import Image
+            cls._ocr_available = True
+        except ImportError:
+            cls._ocr_available = False
+        return cls._ocr_available
+
+    def _ocr_pdf(self, path: str) -> List[Document]:
+        """PDF 扫描件 OCR：用 fitz 将每页渲染为图片，再 tesseract 识别"""
+        import fitz
+        import pytesseract
+        from PIL import Image
+        import io
+
+        docs = []
+        pdf = fitz.open(path)
+        for page_num in range(len(pdf)):
+            page = pdf[page_num]
+            # 300 DPI 渲染
+            pix = page.get_pixmap(dpi=300)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            text = pytesseract.image_to_string(img, lang="chi_sim+eng").strip()
+            if text:
+                docs.append(Document(
+                    page_content=text,
+                    metadata={"source": os.path.basename(path), "page_number": page_num + 1,
+                              "category": "OCR"}
+                ))
+        pdf.close()
+        return docs
+
+    def _ocr_image(self, path: str) -> List[Document]:
+        """单张图片 OCR"""
+        import pytesseract
+        from PIL import Image
+
+        img = Image.open(path)
+        text = pytesseract.image_to_string(img, lang="chi_sim+eng").strip()
+        if text:
+            return [Document(
+                page_content=text,
+                metadata={"source": os.path.basename(path), "page_number": 1, "category": "OCR"}
+            )]
+        return []
+
+    # ========== 文档加载 ==========
     def _loader(self, path):
-        """统一文档加载器：优先使用专用加载器保证解析质量，其余用 UnstructuredFileLoader 兜底"""
+        """统一文档加载器，按后缀选择最佳加载方式"""
         ext = os.path.splitext(path)[1].lower()
 
-        # PDF — PyMuPDF：完全离线、速度快、中文友好
+        # 图片 — 直接走 OCR
+        if ext in self.IMAGE_EXTS:
+            return None  # 特殊标记，在 _load() 中走 OCR
+
+        # PDF — PyMuPDF（数字 PDF 直接读，扫描件后续 fallback）
         if ext == '.pdf':
             from langchain_community.document_loaders import PyMuPDFLoader
             return PyMuPDFLoader(path)
 
-        # DOCX — Docx2txtLoader：轻量，不需要 Word 依赖
+        # DOCX — Docx2txtLoader
         if ext in {'.docx', '.doc'}:
             from langchain_community.document_loaders import Docx2txtLoader
             return Docx2txtLoader(path)
 
-        # TXT/MD — 纯文本，指定 UTF-8 编码
+        # TXT/MD — 纯文本
         if ext in {'.txt', '.md'}:
             from langchain_community.document_loaders import TextLoader
             return TextLoader(path, encoding="utf-8")
 
-        # 其他所有格式 — UnstructuredFileLoader 统一处理
-        # 支持: XLSX, CSV, PPTX, HTML, JSON 等
+        # 其余 — UnstructuredFileLoader 统一处理
         try:
             from langchain_community.document_loaders import UnstructuredFileLoader
             return UnstructuredFileLoader(path, mode="elements")
@@ -50,19 +106,41 @@ class RAGPipelineOffline:
             raise ValueError(f"不支持的文件类型: {ext}（请安装 unstructured 库）")
 
     def _load(self, path):
-        docs = self._loader(path).load()
-        for d in docs: d.metadata.setdefault("source", os.path.basename(path))
+        ext = os.path.splitext(path)[1].lower()
+
+        # 图片直接 OCR
+        if ext in self.IMAGE_EXTS:
+            if not self._check_ocr():
+                raise RuntimeError("OCR 需要安装 pytesseract、pymupdf、Pillow。请运行: pip install pytesseract pymupdf Pillow")
+            return self._ocr_image(path)
+
+        loader = self._loader(path)
+        docs = loader.load()
+        for d in docs:
+            d.metadata.setdefault("source", os.path.basename(path))
+
+        # PDF OCR 回退：如果 PyMuPDF 提取的文字太少（<50 字符），可能是扫描件，走 OCR
+        if ext == '.pdf':
+            total_chars = sum(len(d.page_content.strip()) for d in docs)
+            if total_chars < 50 and self._check_ocr():
+                print(f"[OCR] PDF 文字量仅 {total_chars} 字符，切换 OCR 识别: {os.path.basename(path)}")
+                ocr_docs = self._ocr_pdf(path)
+                if ocr_docs:
+                    return ocr_docs
+
         return docs
 
+    # ========== 入库 ==========
     def ingest_file(self, file_stream: bytes, original_filename: str,
                     uploader_id: str = "system",
-                    doc_code: str = "") -> dict:
-        # 1. 原始文件入库时透传 doc_code
-        file_meta = self.fs.ingest(file_stream, original_filename, uploader_id, doc_code=doc_code)
+                    doc_code: str = "", category: str = "其他", tags: str = "") -> dict:
+        # 1. 原始文件入库
+        file_meta = self.fs.ingest(file_stream, original_filename, uploader_id,
+                                   doc_code=doc_code, category=category, tags=tags)
         self.ms.insert_file(file_meta)
         path, file_id = file_meta["storage_path"], file_meta["file_id"]
 
-        # Layer 2: 加载 + 清洗链
+        # 2. 加载 + 清洗链
         from rag_system.utils.processors import enterprise, merge, fenkuai
         raw = self._load(path)
         cleaned = enterprise(raw)
@@ -75,42 +153,36 @@ class RAGPipelineOffline:
                 f"建议：请检查文件内容或适当放宽清洗规则。"
             )
 
-        # 构建 chunk 记录
+        # 3. 构建 chunk 记录
         records, texts, ids, v_metas = [], [], [], []
         for idx, doc in enumerate(final):
             cid = f"{file_id}#chunk_{idx:04d}"
             m = doc.metadata
-            records.append({"chunk_id": cid, "start_page": m.get("start_page"), "end_page": m.get("end_page"), "char_len": len(doc.page_content), "level": m.get("level"), "category": m.get("category")})
+            records.append({"chunk_id": cid, "start_page": m.get("start_page"), "end_page": m.get("end_page"),
+                           "char_len": len(doc.page_content), "level": m.get("level"), "category": m.get("category")})
             texts.append(doc.page_content)
             ids.append(cid)
             v_metas.append({"chunk_id": cid, "file_id": file_id, "level": m.get("level", "")})
 
-        # 落盘
+        # 4. 落盘
         self.ct.append(file_id, final)
         self.ms.insert_chunks(file_id, records)
         embs = self.model.encode(texts, show_progress_bar=False)
-        # 兼容 tensor 和 numpy 返回
         if hasattr(embs, 'cpu'):
             embs = embs.cpu().numpy()
         self.vs.add(ids, embs, v_metas)
 
         return {"file_id": file_meta["file_id"], "chunks_count": len(ids), "file_meta": file_meta}
 
-    # ========== 新增：带归档的更新 ==========
+    # ========== 带归档的更新 ==========
     def update_file(self, doc_code: str, new_stream: bytes, new_filename: str,
                     uploader_id: str = "system") -> dict:
-        """
-        用 doc_code 定位旧文件 → 归档 → 停用 → 入库新版
-        大模型只需要告诉系统 doc_code + 新文件路径，不用记 file_id
-        """
-        # 1. 按业务编码找到旧版
         old_meta = self.ms.find_by_doc_code(doc_code)
         if not old_meta:
             raise ValueError(f"doc_code={doc_code} 没有对应的活跃文件，请先上传。")
 
         old_file_id = old_meta["file_id"]
 
-        # 2. 归档旧文件全文
         if self.archive:
             self.archive.archive(
                 file_id=old_file_id,
@@ -118,9 +190,7 @@ class RAGPipelineOffline:
                 original_filename=old_meta["original_filename"]
             )
 
-        # 3. 停用旧版本 + 删旧向量
         self.ms.deactivate_file(old_file_id)
         self.vs.delete_by_file_id(old_file_id)
 
-        # 4. 用同一个 doc_code 入库新版（version_tag 自动升级）
         return self.ingest_file(new_stream, new_filename, uploader_id, doc_code=doc_code)
