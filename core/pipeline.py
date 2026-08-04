@@ -23,32 +23,31 @@ class RAGPipelineOffline:
         self.archive = archive_store
 
     def _loader(self, path):
+        """统一文档加载器：优先使用专用加载器保证解析质量，其余用 UnstructuredFileLoader 兜底"""
         ext = os.path.splitext(path)[1].lower()
-        # PDF 用 PyMuPDF，完全离线、速度快、中文友好
+
+        # PDF — PyMuPDF：完全离线、速度快、中文友好
         if ext == '.pdf':
             from langchain_community.document_loaders import PyMuPDFLoader
             return PyMuPDFLoader(path)
-        # 其他格式保持不变
-        elif ext in {'.docx', '.doc'}:
+
+        # DOCX — Docx2txtLoader：轻量，不需要 Word 依赖
+        if ext in {'.docx', '.doc'}:
             from langchain_community.document_loaders import Docx2txtLoader
             return Docx2txtLoader(path)
-        elif ext in {'.txt', '.md'}:
+
+        # TXT/MD — 纯文本，指定 UTF-8 编码
+        if ext in {'.txt', '.md'}:
             from langchain_community.document_loaders import TextLoader
             return TextLoader(path, encoding="utf-8")
-        elif ext in {'.xlsx', '.xls', '.csv'}:
-            from langchain_community.document_loaders import UnstructuredExcelLoader
-            return UnstructuredExcelLoader(path, mode="elements")
-        elif ext in {'.pptx', '.ppt'}:
-            from langchain_community.document_loaders import UnstructuredPowerPointLoader
-            return UnstructuredPowerPointLoader(path, mode="elements")
-        elif ext in {'.html', '.htm'}:
-            from langchain_community.document_loaders import UnstructuredHTMLLoader
-            return UnstructuredHTMLLoader(path)
-        elif ext == '.json':
-            from langchain_community.document_loaders import JSONLoader
-            return JSONLoader(path, jq_schema=".", text_content=False)
-        else:
-            raise ValueError(f"不支持的文件类型: {ext}")
+
+        # 其他所有格式 — UnstructuredFileLoader 统一处理
+        # 支持: XLSX, CSV, PPTX, HTML, JSON 等
+        try:
+            from langchain_community.document_loaders import UnstructuredFileLoader
+            return UnstructuredFileLoader(path, mode="elements")
+        except ImportError:
+            raise ValueError(f"不支持的文件类型: {ext}（请安装 unstructured 库）")
 
     def _load(self, path):
         docs = self._loader(path).load()

@@ -63,10 +63,11 @@ class DeleteFileInput(BaseModel):
 
 class RAGDeleteTool(BaseTool):
     name: str = "rag_delete_file"
-    description: str = "🗑️ 永久删除知识库文件。通过 doc_code 或 file_id 定位，停用元数据、删除向量索引、从磁盘移除原始文件。⚠️ 此操作不可逆！"
+    description: str = "🗑️ 永久删除知识库文件。通过 doc_code 或 file_id 定位，停用元数据、删除向量索引、删除全文索引、从磁盘移除原始文件。⚠️ 此操作不可逆！"
     args_schema: type = DeleteFileInput
     metadata_store: object = None
     vector_store: object = None
+    clean_text_store: object = None
 
     def _run(self, doc_code: str = "", file_id: str = "") -> str:
         # 通过 doc_code 或 file_id 定位文件
@@ -90,7 +91,10 @@ class RAGDeleteTool(BaseTool):
         self.metadata_store.deactivate_file(file_id)
         # 2. 删除向量索引
         self.vector_store.delete_by_file_id(file_id)
-        # 3. 从磁盘删除原始文件
+        # 3. 删除全文索引（FTS5）
+        if self.clean_text_store:
+            self.clean_text_store.delete_by_file_id(file_id)
+        # 4. 从磁盘删除原始文件
         if storage_path:
             sp = Path(storage_path)
             if sp.exists():

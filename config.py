@@ -15,7 +15,7 @@ ORIGINAL_STORE_PATH = os.path.join(STORAGE_DIR, "originals")
 ARCHIVE_STORE_PATH = os.path.join(STORAGE_DIR, "archive")
 VECTOR_STORE_PATH = os.path.join(STORAGE_DIR, "vectors")
 METADATA_DB_PATH = os.path.join(STORAGE_DIR, "metadata.db")
-CLEAN_TEXT_PATH = os.path.join(STORAGE_DIR, "clean_texts.jsonl")
+CLEAN_TEXT_PATH = os.path.join(STORAGE_DIR, "clean_texts.db")
 
 # 归档策略
 ARCHIVE_TTL_DAYS = 30

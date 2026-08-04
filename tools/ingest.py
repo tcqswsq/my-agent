@@ -1,3 +1,4 @@
+from typing import ClassVar
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 from pathlib import Path
@@ -31,9 +32,43 @@ class IngestFolderInput(BaseModel):
 
 class RAGIngestFolderTool(BaseTool):
     name: str = "rag_ingest_folder"
-    description: str = "📁 批量上传文件夹内的所有文档到知识库。"
+    description: str = "📁 批量上传文件夹内的所有文档到知识库。支持递归子目录。"
     args_schema: type = IngestFolderInput
     pipeline: object = None
 
+    # 支持的文件后缀
+    SUPPORTED_EXT: ClassVar[set] = {'.pdf', '.docx', '.doc', '.txt', '.md', '.xlsx', '.xls',
+                                     '.csv', '.pptx', '.ppt', '.html', '.htm', '.json'}
+
     def _run(self, folder_path: str, uploader_id: str = "system", recursive: bool = True) -> str:
-        return "批量上传完成"
+        path = Path(folder_path)
+        if not path.exists():
+            return f"❌ 文件夹不存在: {folder_path}"
+        if not path.is_dir():
+            return f"❌ 路径不是文件夹: {folder_path}"
+
+        # 扫描文件
+        if recursive:
+            files = [f for f in path.rglob('*') if f.is_file() and f.suffix.lower() in self.SUPPORTED_EXT]
+        else:
+            files = [f for f in path.iterdir() if f.is_file() and f.suffix.lower() in self.SUPPORTED_EXT]
+
+        if not files:
+            return f"⚠️ 文件夹中没有支持的文件类型: {folder_path}\n支持: {', '.join(sorted(self.SUPPORTED_EXT))}"
+
+        results = []
+        success_count = 0
+        for fp in files:
+            try:
+                with open(fp, "rb") as fh:
+                    data = fh.read()
+                # 用文件名（不含扩展名）作为 doc_code
+                doc_code = fp.stem
+                result = self.pipeline.ingest_file(data, fp.name, uploader_id, doc_code=doc_code)
+                results.append(f"  ✅ {fp.name} → {result['chunks_count']} chunks (id={result['file_id']})")
+                success_count += 1
+            except Exception as e:
+                results.append(f"  ❌ {fp.name}: {str(e)[:100]}")
+
+        summary = f"📁 批量上传完成: {success_count}/{len(files)} 个文件成功"
+        return summary + "\n" + "\n".join(results)

@@ -54,6 +54,6 @@ def build():
         RAGUpdateTool(pipeline=pipeline),
         RAGListArchiveTool(archive_store=archive),
         RAGListActiveTool(metadata_store=ms),
-        RAGDeleteTool(metadata_store=ms, vector_store=vs),
+        RAGDeleteTool(metadata_store=ms, vector_store=vs, clean_text_store=ct),
     ]
     return retriever_lc, tools

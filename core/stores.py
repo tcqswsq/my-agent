@@ -213,37 +213,104 @@ class VectorStore:
             where=where
         )
 
-# ======================= 清洗文本存储 =======================
+# ======================= 清洗文本存储（SQLite + FTS5） =======================
 class CleanTextStore:
-    def __init__(self, path: str = "storage/clean_texts.jsonl"):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    """文本存储 + 全文检索，基于 SQLite FTS5（替代 JSONL + 内存 BM25）"""
+
+    def __init__(self, db_path: str = "storage/clean_texts.db"):
+        self.db_path = db_path
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self):
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=30.0,
+            check_same_thread=False
+        )
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self):
+        with self._connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS clean_texts (
+                    chunk_id TEXT PRIMARY KEY,
+                    file_id TEXT NOT NULL,
+                    text TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_clean_texts_file ON clean_texts(file_id);
+                CREATE VIRTUAL TABLE IF NOT EXISTS texts_fts USING fts5(
+                    chunk_id UNINDEXED,
+                    text,
+                    tokenize='unicode61',
+                    prefix='2'
+                );
+            """)
+            conn.commit()
 
     def append(self, file_id: str, chunks: List):
-        with open(self.path, "a", encoding="utf-8") as f:
+        with self._connect() as conn:
             for idx, doc in enumerate(chunks):
-                obj = {
-                    "chunk_id": f"{file_id}#chunk_{idx:04d}",
-                    "text": doc.page_content
-                }
-                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                cid = f"{file_id}#chunk_{idx:04d}"
+                conn.execute(
+                    "INSERT OR REPLACE INTO clean_texts (chunk_id, file_id, text) VALUES (?, ?, ?)",
+                    (cid, file_id, doc.page_content)
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO texts_fts (chunk_id, text) VALUES (?, ?)",
+                    (cid, doc.page_content)
+                )
+            conn.commit()
 
     def fetch(self, chunk_ids: List[str]) -> Dict[str, str]:
-        target = set(chunk_ids)
-        result = {}
-        if not self.path.exists():
-            return result
+        if not chunk_ids:
+            return {}
+        with self._connect() as conn:
+            placeholders = ','.join(['?'] * len(chunk_ids))
+            rows = conn.execute(
+                f"SELECT chunk_id, text FROM clean_texts WHERE chunk_id IN ({placeholders})",
+                chunk_ids
+            ).fetchall()
+        return {r["chunk_id"]: r["text"] for r in rows}
 
-        with open(self.path, "r", encoding="utf-8") as f:
-            for line in f:
-                obj = json.loads(line)
-                cid = obj["chunk_id"]
-                if cid in target:
-                    result[cid] = obj["text"]
-                    target.discard(cid)
-                    if not target:
-                        break
-        return result
+    def bm25_search(self, query: str, top_k: int = 100) -> Dict[str, float]:
+        """FTS5 关键词检索，返回 {chunk_id: bm25_score}（0~1，越大越相关）"""
+        # 清洗查询字符串，每个词用 OR 连接
+        safe = query.replace('"', '').replace("'", "")
+        terms = ' OR '.join(t for t in safe.split() if len(t) >= 1)
+        if not terms:
+            return {}
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT chunk_id, rank FROM texts_fts WHERE texts_fts MATCH ? ORDER BY rank LIMIT ?",
+                    (terms, top_k)
+                ).fetchall()
+            if not rows:
+                return {}
+            # FTS5 rank: 负值，越小越好。归一化到 [0, 1]，越大越好
+            ranks = [r["rank"] for r in rows]
+            min_r, max_r = ranks[-1], ranks[0]
+            if max_r == min_r:
+                return {r["chunk_id"]: 0.8 for r in rows}
+            return {r["chunk_id"]: round(1.0 - (r["rank"] - min_r) / (max_r - min_r), 4) for r in rows}
+        except Exception:
+            return {}
+
+    def delete_by_file_id(self, file_id: str):
+        """删除文件对应的所有文本（FTS5 + 主表）"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT chunk_id FROM clean_texts WHERE file_id = ?", (file_id,)
+            ).fetchall()
+            for r in rows:
+                conn.execute("DELETE FROM texts_fts WHERE chunk_id = ?", (r["chunk_id"],))
+            conn.execute("DELETE FROM clean_texts WHERE file_id = ?", (file_id,))
+            conn.commit()
 
 
 # ======================= 归档存储 =======================

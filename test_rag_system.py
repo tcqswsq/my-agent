@@ -639,7 +639,7 @@ class TestBuild(unittest.TestCase):
         # API 模式下不会加载本地模型，直接测试即可
         import os
         os.environ.setdefault("EMBED_MODE", "api")
-        from build import build
+        from .build import build
         retriever, tools = build()
 
         self.assertIsNotNone(retriever)
