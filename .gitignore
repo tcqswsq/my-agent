@@ -2,6 +2,7 @@
 .env
 *.env
 webapp.spec
+.gitignore
 
 # ── 本地数据 ──
 storage/

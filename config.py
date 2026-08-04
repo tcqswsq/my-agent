@@ -1,8 +1,5 @@
 import os
 
-# ── Embedding 模式: "api" 或 "local" ──
-# api:   通过 DeepSeek Embedding API（默认，无需本地模型）
-# local: 使用本地 SentenceTransformer 模型
 EMBED_MODE = os.getenv("EMBED_MODE", "api")
 
 # 模型路径（仅本地模式需要）
