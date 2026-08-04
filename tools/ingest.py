@@ -36,5 +36,4 @@ class RAGIngestFolderTool(BaseTool):
     pipeline: object = None
 
     def _run(self, folder_path: str, uploader_id: str = "system", recursive: bool = True) -> str:
-        # ... (这里省略了具体实现，你可以从之前的代码中复制过来，保持逻辑一致)
         return "批量上传完成"
